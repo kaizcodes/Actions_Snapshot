@@ -1,6 +1,6 @@
 # Action Snapshots
 
-Blender add-on that automatically saves a `.blend` copy for every new Undo History entry, named `<session> + <action>.blend`.
+Blender add-on that automatically creates a `.blend` copy for every new Undo History entry, named `<session> + <action>.blend`.
 
 ## Install
 Edit > Preferences > Add-ons > Install from Disk > `action_snapshots.py`, then enable it.
