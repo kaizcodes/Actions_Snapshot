@@ -2,6 +2,8 @@
 
 Blender add-on that automatically creates a `.blend` copy for every new Undo History entry, named `<session> + <action>.blend`.
 
+If you crash often or sometimes forget to save before a crucial step that will dominos your project down the drain then this is the plugin for you.
+
 ## Install
 Edit > Preferences > Add-ons > Install from Disk > `action_snapshots.py`, then enable it.
 
