@@ -1,10 +1,10 @@
 bl_info = {
     "name": "Action Snapshots",
     "author": "",
-    "version": (2, 0, 0),
+    "version": (2, 1, 0),
     "blender": (4, 0, 0),
     "location": "Edit > Preferences > Add-ons",
-    "description": "Saves a .blend copy for every new entry in the Undo History, named '<session> + <action>'",
+    "description": "Saves a .blend copy for every new entry in the Undo History, named '<session> + <action> (<objects>)'",
     "category": "System",
 }
 
@@ -229,7 +229,9 @@ _pointers = None  # step pointers at the last sync; None = resync silently on ne
 _active = None
 _last_scan = 0.0
 _warned = False
-_pending = []  # [(name, attempts)] snapshots still to save
+_pending = []  # snapshots still to save: {"action", "due", "attempts", "targets"}
+_baseline = None  # {pointer: (name, selected, mode)} of view-layer objects at the last sync
+_updated = {}  # (id type, id name) -> None, in the order the depsgraph reported them
 
 
 def _stack_address(now):
@@ -254,14 +256,99 @@ def _stack_address(now):
 
 
 def _sync():
-    """Adopt the current undo stack as the baseline without saving anything."""
+    """Adopt the current undo stack and scene as the baseline without saving anything."""
     global _pointers, _active
     stack = _stack_address(time.monotonic())
     chain = _read_chain(stack) if stack else None
     if chain:
         _pointers, _active = chain
+        _reset_targets()
     else:
         _pointers = None
+
+
+# --------------------------------------------------------------------------- target objects
+
+# Blender does not record which object an undo step edited, so it is inferred by diffing the
+# view layer against the previous action and by listing what the depsgraph reported as updated.
+# In priority order: added objects, removed objects, updated objects, then objects whose
+# selection / mode / name changed.
+
+SETTLE_DELAY = 0.1  # depsgraph evaluation runs just after an operator; let it report first
+MAX_TARGET_NAMES = 3
+_MAX_UPDATES = 1000
+_IGNORED_UPDATES = ("Scene", "Screen", "WorkSpace", "WindowManager", "Window")
+
+
+def _scene_objects():
+    try:
+        objects = bpy.context.view_layer.objects
+    except AttributeError:
+        return None
+    state = {}
+    for obj in objects:
+        try:
+            selected = obj.select_get()
+        except RuntimeError:
+            selected = False
+        state[obj.as_pointer()] = (obj.name, selected, obj.mode)
+    return state
+
+
+def _reset_targets():
+    global _baseline
+    _baseline = _scene_objects()
+    _updated.clear()
+
+
+def _take_targets():
+    """Names of the objects touched since the last call; advances the baseline."""
+    global _baseline
+    previous, current = _baseline, _scene_objects()
+    _baseline = current
+    updated = list(_updated)
+    _updated.clear()
+    if previous is None or current is None:
+        return []
+    added = [state[0] for pointer, state in current.items() if pointer not in previous]
+    if added:
+        return added
+    removed = [state[0] for pointer, state in previous.items() if pointer not in current]
+    if removed:
+        return removed
+    names = {state[0] for state in current.values()}
+    touched = []
+    for kind, name in updated:
+        if kind == "Object":
+            if name in names:
+                touched.append(name)
+        else:  # object data (mesh, camera, light...): report the objects that use it
+            for obj in bpy.context.view_layer.objects:
+                data = obj.data
+                if data is not None and data.name == name and type(data).__name__ == kind:
+                    touched.append(obj.name)
+    if touched:
+        return list(dict.fromkeys(touched))
+    return [state[0] for pointer, state in current.items() if previous[pointer] != state]
+
+
+def _format_targets(names):
+    if not names:
+        return ""
+    shown = ", ".join(_clean(name) for name in names[:MAX_TARGET_NAMES])
+    extra = len(names) - MAX_TARGET_NAMES
+    return f" ({shown}{f' +{extra}' if extra > 0 else ''})"
+
+
+@persistent
+def _on_depsgraph(_scene, depsgraph):
+    if len(_updated) >= _MAX_UPDATES:
+        return
+    for update in depsgraph.updates:
+        kind = type(update.id).__name__
+        if kind not in _IGNORED_UPDATES:
+            _updated[(kind, update.id.name)] = None
+
 
 
 # --------------------------------------------------------------------------- saving
@@ -287,9 +374,9 @@ def _snapshot_dir():
     return root
 
 
-def _save(action):
+def _save(action, targets):
     directory = _snapshot_dir()
-    stem = f"{_clean(_session_name())} + {_clean(action)}"
+    stem = f"{_clean(_session_name())} + {_clean(action)}{_format_targets(targets)}"
     path = directory / f"{stem}.blend"
     number = 2
     while path.exists():
@@ -299,18 +386,22 @@ def _save(action):
     print(f"{_PREFIX} saved {path}")
 
 
-def _flush_pending():
-    global _pending
-    remaining = []
-    for name, attempts in _pending:
+def _flush_pending(now):
+    due = [item for item in _pending if item["due"] <= now]
+    targets = None
+    for item in due:
+        if item["targets"] is None:
+            if targets is None:
+                targets = _take_targets()
+            item["targets"] = targets
         try:
-            _save(name)
+            _save(item["action"], item["targets"])
+            _pending.remove(item)
         except Exception as exc:
-            if attempts + 1 < MAX_SAVE_ATTEMPTS:
-                remaining.append((name, attempts + 1))
-            else:
-                print(f"{_PREFIX} giving up on '{name}': {exc!r}")
-    _pending = remaining
+            item["attempts"] += 1
+            if item["attempts"] >= MAX_SAVE_ATTEMPTS:
+                print(f"{_PREFIX} giving up on '{item['action']}': {exc!r}")
+                _pending.remove(item)
 
 
 # --------------------------------------------------------------------------- polling
@@ -319,7 +410,8 @@ def _flush_pending():
 def _poll():
     global _pointers, _active
     try:
-        stack = _stack_address(time.monotonic())
+        now = time.monotonic()
+        stack = _stack_address(now)
         chain = _read_chain(stack) if stack else None
         if not chain:
             _pointers = None
@@ -327,6 +419,7 @@ def _poll():
         pointers, active = chain
         if _pointers is None:
             _pointers, _active = pointers, active
+            _reset_targets()
         elif pointers != _pointers or active != _active:
             # Undo / redo / history jumps resync in their handlers, so anything that changed
             # since the last sync is a push. A push that reused a freed step's address leaves
@@ -339,9 +432,9 @@ def _poll():
             for step in new:
                 name = _step_name(step)
                 if name is not None and not _step_skipped(step):
-                    _pending.append((name, 0))
+                    _pending.append({"action": name, "due": now + SETTLE_DELAY, "attempts": 0, "targets": None})
         if _pending:
-            _flush_pending()
+            _flush_pending(now)
     except Exception as exc:
         print(f"{_PREFIX} {exc!r}")
     return POLL_INTERVAL
@@ -357,23 +450,27 @@ def _on_undo_redo(*_args):
 
 @persistent
 def _on_load(*_args):
-    global _pointers
+    global _pointers, _baseline
     _pointers = None
+    _baseline = None
     _pending.clear()
+    _updated.clear()
 
 
 # --------------------------------------------------------------------------- registration
 
 
 def register():
-    global _read, _path, _pointers, _warned, _last_scan
+    global _read, _path, _pointers, _baseline, _warned, _last_scan
     _read = _build_reader()
-    _path, _pointers, _warned, _last_scan = None, None, False, 0.0
+    _path, _pointers, _baseline, _warned, _last_scan = None, None, None, False, 0.0
     _pending.clear()
+    _updated.clear()
     for handlers, func in (
         (bpy.app.handlers.undo_post, _on_undo_redo),
         (bpy.app.handlers.redo_post, _on_undo_redo),
         (bpy.app.handlers.load_post, _on_load),
+        (bpy.app.handlers.depsgraph_update_post, _on_depsgraph),
     ):
         if func not in handlers:
             handlers.append(func)
@@ -388,6 +485,7 @@ def unregister():
         (bpy.app.handlers.undo_post, _on_undo_redo),
         (bpy.app.handlers.redo_post, _on_undo_redo),
         (bpy.app.handlers.load_post, _on_load),
+        (bpy.app.handlers.depsgraph_update_post, _on_depsgraph),
     ):
         if func in handlers:
             handlers.remove(func)
