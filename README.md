@@ -10,6 +10,7 @@ Snapshots go in an `action_snapshots/` folder next to your `.blend` (or in Blend
 
 ## How it works
 Blender's Python API can't read Undo History, so the add-on reads the undo stack from its own process's memory (read-only, fails safely) and polls it every 0.1s.
+
 It also let you have INFINITE UNDO and a clear history of your work so you know where you fucked up.
 
 ## Notes
