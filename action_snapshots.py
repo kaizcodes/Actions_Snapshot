@@ -36,6 +36,7 @@ from bpy.app.handlers import persistent
 
 POLL_INTERVAL = 0.1  # seconds between undo stack checks
 RESCAN_INTERVAL = 1.0  # minimum seconds between searches for the undo stack
+RETRY_INTERVAL = 0.02  # poll rate while snapshots are queued, so slow saves don't stall the UI
 MAX_SAVE_ATTEMPTS = 20
 _NAME_OFFSET = 16  # UndoStep.name, after next/prev
 _NAME_SIZE = 64
@@ -227,18 +228,29 @@ def _locate():
 _path = None  # offsets from wm to the UndoStack pointer
 _pointers = None  # step pointers at the last sync; None = resync silently on next poll
 _active = None
+_header = None  # (first, last, active) at the last sync; unchanged header = nothing to read
 _last_scan = 0.0
 _warned = False
 _pending = []  # snapshots still to save: {"action", "due", "attempts", "targets"}
-_baseline = None  # {pointer: (name, selected, mode)} of view-layer objects at the last sync
+_next_number = {}  # snapshot file stem -> first duplicate number worth probing
+_baseline = None  # (object names, {name: (selected, mode)}) at the last sync
 _updated = {}  # (id type, id name) -> None, in the order the depsgraph reported them
+
+
+def _read_header(stack):
+    """(first, last, active) of the UndoStack in a single read, or None if unreadable."""
+    raw = _read(stack, 24)
+    if not raw:
+        return None
+    header = struct.unpack("<3Q", raw)
+    return header if header[0] and header[1] else None
 
 
 def _stack_address(now):
     global _path, _last_scan, _pointers, _warned
     if _path:
         addr = _resolve(_path)
-        if addr and _read_chain(addr):
+        if addr and _read_header(addr):
             return addr
     if now - _last_scan < RESCAN_INTERVAL:
         return None
@@ -257,14 +269,15 @@ def _stack_address(now):
 
 def _sync():
     """Adopt the current undo stack and scene as the baseline without saving anything."""
-    global _pointers, _active
+    global _pointers, _active, _header
     stack = _stack_address(time.monotonic())
     chain = _read_chain(stack) if stack else None
     if chain:
         _pointers, _active = chain
+        _header = (_pointers[0], _pointers[-1], _active)
         _reset_targets()
     else:
-        _pointers = None
+        _pointers = _header = None
 
 
 # --------------------------------------------------------------------------- target objects
@@ -281,18 +294,18 @@ _IGNORED_UPDATES = ("Scene", "Screen", "WorkSpace", "WindowManager", "Window")
 
 
 def _scene_objects():
+    """(all object names, {name: (selected, mode)} for selected / active objects), or None."""
     try:
         objects = bpy.context.view_layer.objects
     except AttributeError:
         return None
-    state = {}
-    for obj in objects:
-        try:
-            selected = obj.select_get()
-        except RuntimeError:
-            selected = False
-        state[obj.as_pointer()] = (obj.name, selected, obj.mode)
-    return state
+    # Mode and selection can only differ on the selected / active objects, so avoid touching
+    # every object in the scene: names come straight from the collection keys.
+    flags = {obj.name: (True, obj.mode) for obj in objects.selected}
+    active = objects.active
+    if active is not None and active.name not in flags:
+        flags[active.name] = (False, active.mode)
+    return set(objects.keys()), flags
 
 
 def _reset_targets():
@@ -310,26 +323,33 @@ def _take_targets():
     _updated.clear()
     if previous is None or current is None:
         return []
-    added = [state[0] for pointer, state in current.items() if pointer not in previous]
+    names, flags = current
+    previous_names, previous_flags = previous
+    added = names - previous_names
     if added:
-        return added
-    removed = [state[0] for pointer, state in previous.items() if pointer not in current]
+        return [name for name in bpy.context.view_layer.objects.keys() if name in added]
+    removed = previous_names - names
     if removed:
-        return removed
-    names = {state[0] for state in current.values()}
+        return sorted(removed)
     touched = []
+    users = None
     for kind, name in updated:
         if kind == "Object":
             if name in names:
                 touched.append(name)
         else:  # object data (mesh, camera, light...): report the objects that use it
-            for obj in bpy.context.view_layer.objects:
-                data = obj.data
-                if data is not None and data.name == name and type(data).__name__ == kind:
-                    touched.append(obj.name)
+            if users is None:  # one pass over the scene, however many datablocks updated
+                users = {}
+                for obj in bpy.context.view_layer.objects:
+                    data = obj.data
+                    if data is not None:
+                        users.setdefault((type(data).__name__, data.name), []).append(obj.name)
+            touched.extend(users.get((kind, name), ()))
     if touched:
         return list(dict.fromkeys(touched))
-    return [state[0] for pointer, state in current.items() if previous[pointer] != state]
+    changed = [name for name, state in flags.items() if previous_flags.get(name) != state]
+    changed.extend(name for name in previous_flags if name not in flags and name in names)
+    return changed
 
 
 def _format_targets(names):
@@ -344,10 +364,16 @@ def _format_targets(names):
 def _on_depsgraph(_scene, depsgraph):
     if len(_updated) >= _MAX_UPDATES:
         return
+    screen = bpy.context.screen
+    if screen is not None and screen.is_animation_playing:
+        return  # per-frame updates during playback are never an undo action
     for update in depsgraph.updates:
-        kind = type(update.id).__name__
+        id_ = update.id
+        kind = type(id_).__name__
         if kind not in _IGNORED_UPDATES:
-            _updated[(kind, update.id.name)] = None
+            _updated[(kind, id_.name)] = None
+            if len(_updated) >= _MAX_UPDATES:
+                return
 
 
 
@@ -377,67 +403,92 @@ def _snapshot_dir():
 def _save(action, targets):
     directory = _snapshot_dir()
     stem = f"{_clean(_session_name())} + {_clean(action)}{_format_targets(targets)}"
-    path = directory / f"{stem}.blend"
-    number = 2
-    while path.exists():
-        path = directory / f"{stem} ({number}).blend"
+    key = str(directory / stem)
+    number = _next_number.get(key, 1)
+    while True:
+        path = directory / (f"{stem}.blend" if number == 1 else f"{stem} ({number}).blend")
+        if not path.exists():
+            break
         number += 1
-    bpy.ops.wm.save_as_mainfile(filepath=str(path), check_existing=False, copy=True)
+    # The file thumbnail is rendered offscreen on every save; a snapshot copy never needs one.
+    filepaths = bpy.context.preferences.filepaths
+    preview = filepaths.file_preview_type
+    filepaths.file_preview_type = "NONE"
+    try:
+        bpy.ops.wm.save_as_mainfile(filepath=str(path), check_existing=False, copy=True)
+    finally:
+        filepaths.file_preview_type = preview
+    _next_number[key] = number + 1
     print(f"{_PREFIX} saved {path}")
 
 
 def _flush_pending(now):
+    """Save at most one due snapshot per call so the UI can redraw between slow saves."""
     due = [item for item in _pending if item["due"] <= now]
+    if not due:
+        return
     targets = None
     for item in due:
         if item["targets"] is None:
             if targets is None:
                 targets = _take_targets()
             item["targets"] = targets
-        try:
-            _save(item["action"], item["targets"])
+    item = due[0]
+    try:
+        _save(item["action"], item["targets"])
+        _pending.remove(item)
+    except Exception as exc:
+        item["attempts"] += 1
+        item["due"] = now + POLL_INTERVAL
+        if item["attempts"] >= MAX_SAVE_ATTEMPTS:
+            print(f"{_PREFIX} giving up on '{item['action']}': {exc!r}")
             _pending.remove(item)
-        except Exception as exc:
-            item["attempts"] += 1
-            if item["attempts"] >= MAX_SAVE_ATTEMPTS:
-                print(f"{_PREFIX} giving up on '{item['action']}': {exc!r}")
-                _pending.remove(item)
 
 
 # --------------------------------------------------------------------------- polling
 
 
 def _poll():
-    global _pointers, _active
+    global _pointers, _active, _header, _path
+    interval = POLL_INTERVAL
     try:
         now = time.monotonic()
         stack = _stack_address(now)
-        chain = _read_chain(stack) if stack else None
-        if not chain:
-            _pointers = None
-            return POLL_INTERVAL
-        pointers, active = chain
-        if _pointers is None:
-            _pointers, _active = pointers, active
-            _reset_targets()
-        elif pointers != _pointers or active != _active:
-            # Undo / redo / history jumps resync in their handlers, so anything that changed
-            # since the last sync is a push. A push that reused a freed step's address leaves
-            # the chain unchanged; it is recognisable because the active step is the newest.
-            known = set(_pointers)
-            new = [step for step in pointers if step not in known]
-            if not new and active == pointers[-1]:
-                new = [active]
-            _pointers, _active = pointers, active
-            for step in new:
-                name = _step_name(step)
-                if name is not None and not _step_skipped(step):
-                    _pending.append({"action": name, "due": now + SETTLE_DELAY, "attempts": 0, "targets": None})
+        header = _read_header(stack) if stack else None
+        if header is None:
+            _pointers = _header = None
+        elif header != _header or _pointers is None:
+            # Only walk the whole step chain when first / last / active moved: every push,
+            # undo, redo or history trim changes at least one of them.
+            chain = _read_chain(stack)
+            if not chain:
+                _pointers = _header = _path = None  # stale pointer: search again
+                return interval
+            pointers, active = chain
+            _header = (pointers[0], pointers[-1], active)
+            if _pointers is None:
+                _pointers, _active = pointers, active
+                _reset_targets()
+            else:
+                # Undo / redo / history jumps resync in their handlers, so anything that changed
+                # since the last sync is a push. A push that reused a freed step's address leaves
+                # the chain unchanged; it is recognisable because the active step is the newest.
+                known = set(_pointers)
+                new = [step for step in pointers if step not in known]
+                if not new and active == pointers[-1]:
+                    new = [active]
+                _pointers, _active = pointers, active
+                for step in new:
+                    name = _step_name(step)
+                    if name is not None and not _step_skipped(step):
+                        _pending.append({"action": name, "due": now + SETTLE_DELAY, "attempts": 0, "targets": None})
         if _pending:
             _flush_pending(now)
+            if _pending:
+                interval = RETRY_INTERVAL
     except Exception as exc:
         print(f"{_PREFIX} {exc!r}")
-    return POLL_INTERVAL
+    return interval
 
 
 @persistent
@@ -455,6 +506,7 @@ def _on_load(*_args):
     _baseline = None
     _pending.clear()
     _updated.clear()
+    _next_number.clear()
 
 
 # --------------------------------------------------------------------------- registration
@@ -466,6 +518,7 @@ def register():
     _path, _pointers, _baseline, _warned, _last_scan = None, None, None, False, 0.0
     _pending.clear()
     _updated.clear()
+    _next_number.clear()
     for handlers, func in (
         (bpy.app.handlers.undo_post, _on_undo_redo),
         (bpy.app.handlers.redo_post, _on_undo_redo),
